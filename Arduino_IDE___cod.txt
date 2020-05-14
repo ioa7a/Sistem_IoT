@@ -1,0 +1,269 @@
+#include "SHT1x.h"
+#include "ccs811.h"
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+
+CCS811 ccs811(D7); // nWAKE pe D7
+LiquidCrystal_I2C lcd(0x27, 16,2); 
+#define dataPin  D6   //data pin pentru SHT10
+#define clockPin D5   //clock pin pentru SHT10
+#define buzzerPin D8  //buzzer pentru alarma
+SHT1x sht1x(dataPin, clockPin);
+
+//Pentru conectarea la Thingspeak. API-key in secrets.h
+#include "ThingSpeak.h"
+#include "secrets.h"
+unsigned long myChannelNumber = SECRET_CH_ID;
+unsigned long myChannelNumberAlarma = SECRET_CH_ID_ALARMA;
+const char * myWriteAPIKey = SECRET_WRITE_APIKEY;
+const char * myReadAPIKey = SECRET_READ_APIKEY;
+//pentru conectarea la Wi-Fi. Parola in secrets.h
+#include <ESP8266WiFi.h>
+char ssid[] = SECRET_SSID;   // your network SSID (name)
+char pass[] = SECRET_PASS;   // your network password
+int keyIndex = 0;            // your network key index number (needed only for WEP)
+WiFiClient  client;
+
+int nr=1;         //1-temperatura 2-umiditate 3-eCO2 4-eTVOC
+byte grad[8] = {  //simbol grad
+  B01110, 
+  B10001, 
+  B10001, 
+  B01110, 
+  B00000, 
+  B00000, 
+  B00000, 
+  B00000};
+
+void setup()
+{
+  Wire.begin(); //porneste conexiunea I2C
+  //Serial.begin(38400); // Open serial connection to report values to host
+  ccs811.set_i2cdelay(50); // Needed for ESP8266 because it doesn't handle I2C clock stretch correctly
+  bool ok = ccs811.begin();
+  if( !ok ) ;///Serial.println("setup: CCS811 begin FAILED");
+  
+  // Start senzor CCS811
+  ok= ccs811.start(CCS811_MODE_1SEC);
+  if( !ok ) ;///Serial.println("setup: CCS811 start FAILED");
+
+  lcd.init(); //Initializare LCD I2C
+  
+  WiFi.mode(WIFI_STA);
+  ThingSpeak.begin(client);
+  lcd.createChar(0, grad);
+}
+
+//functie care activeaza buzzer-ul
+void playTone() {
+   tone(buzzerPin,1000);
+   delay(1000);
+   noTone(buzzerPin);
+   delay(1000);        
+}
+
+//functie care afiseaza pe ecran daca un parametru a iesit din limitele prestabilite si porneste buzzer-ul
+//returneaza false daca valorile sunt intre limite si true daca depasesc
+bool verificare_alarma(int nr, String s) {
+  int alarma = ThingSpeak.readIntField(myChannelNumberAlarma, nr, myReadAPIKey);  //citire ultima valoare din canalul cu alarme, field-ul cu indicele 'nr'
+  //alarma=0 valoare normala, alarma=1  valoare prea mare, alarma=-1 valoare prea mica
+  int statusCode = ThingSpeak.getLastReadStatus();
+  if (statusCode == 200) { //valoarea e valida 
+      if(alarma == 0){
+         //Serial.println("totul bine");
+         return false;
+      } else if(alarma == 1){
+         lcd.clear(); 
+         lcd.setCursor(0, 0);
+         lcd.print(s + " prea mare!");
+         for(int t=1;t<=3;t++)playTone();
+         return true;
+      } else {
+         lcd.clear(); 
+         lcd.setCursor(0, 0);
+         lcd.print(s + " prea mica!");
+         for(int t=1;t<=3;t++)playTone();
+         return true;
+      }
+    } else {  //Nu s-a putut citi valoarea de pe canal
+        // Serial.print("Unable to read channel ");
+        // Serial.println(" / No internet connection");
+        return false;
+    } 
+}
+
+void loop()
+{
+  lcd.backlight();
+  float temp_c;
+  float humidity;
+ 
+  // Achizitionam valorile temperaturii si umiditatii de la senzorul SHT10
+  temp_c = sht1x.readTemperatureC();
+  humidity = sht1x.readHumidity();
+
+  // Achizitionam valorile eCO2 si eTVOC de la senzorul CCS811
+  uint16_t eco2, etvoc, errstat, raw;
+  ccs811.read(&eco2,&etvoc,&errstat,&raw); 
+
+  if(nr==1){ //prima oara cand porneste dupa RESET (la prima pornire sau dupa DeepSleep)
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Conectare Wi-Fi");
+    lcd.setCursor(0, 1);
+   }
+
+  // Conectare sau reconectare WiFi
+  if (WiFi.status() != WL_CONNECTED) {    //Nu s-a conectat
+    int incercare = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+      incercare++;
+      if(incercare==8){ //Dupa 8 incercari va intra in DeepSleep pentru 2 minute si apoi va reincerca sa se contecteze dupa 5 secunde
+         lcd.clear(); 
+         lcd.setCursor(0, 1);
+         lcd.print(temp_c);
+         lcd.write(byte(0));
+         lcd.setCursor(8, 1);
+         lcd.print(humidity);
+         lcd.print("%");       
+         lcd.setCursor(0, 0);
+         lcd.print(eco2);
+         lcd.print("ppm");
+         lcd.setCursor(8, 0);
+         lcd.print(etvoc); 
+         lcd.print("ppb");
+         lcd.setCursor(15, 1);
+         lcd.print("Z");      //Simbolul Z din dreapta jos arata ca este in modul DeepSleep
+         lcd.noBacklight();   //Cat timp este in DeepSleep oprim lumina de fundal de la LCD (valorile vor fi inca vizibile)
+         ESP.deepSleep(120e6);//120e6 inseamna 120.000.000 microsecunde = 2 minute
+      }
+      WiFi.begin(ssid, pass); // Conectarea la  retea
+      lcd.print(".");         // Afisare .... pana cand se conecteaza. Maxim 8 incercari
+      delay(5000);            // Dupa 5 secunde reincercearca sa se conecteze
+    }
+   //Conectare realizata
+  }
+
+  switch(nr){
+    case 1: { //TEMPERATURA
+      int httpCode = ThingSpeak.writeField(myChannelNumber, 1, temp_c, myWriteAPIKey); //Scriere valori in field 1 al canalului ThingSpeak
+      if(verificare_alarma(nr,"Temp.")){  //Verificam daca valoarea a depasit limitele (daca DA, se afiseaza pe ecran "Temp prea mare" sau "Temp prea mica" pe primul rand
+        lcd.setCursor(0, 1);     
+        lcd.print("Ultima:");
+        lcd.print(temp_c);
+        lcd.write(byte(0));
+        delay(1000);
+      }
+      break;
+    }
+    case 2: { //UMIDITATE
+      int httpCode = ThingSpeak.writeField(myChannelNumber, 2, humidity, myWriteAPIKey);
+      if(verificare_alarma(nr,"Umidit.")) { 
+        lcd.setCursor(0, 1);
+        lcd.print("Ultima:");
+        lcd.print(humidity);
+        lcd.print("%");
+        delay(1000);
+      }
+      break;
+     }
+     case 3: { //eCO2
+       int  httpCode = ThingSpeak.writeField(myChannelNumber, 3, eco2, myWriteAPIKey);
+       if(verificare_alarma(nr,"eCO2")) { 
+         lcd.setCursor(0, 1);
+         lcd.print("Ultima:");
+         lcd.print(eco2);
+         lcd.print("ppm");
+         delay(1000);
+       }
+      break;
+      }
+    case 4: {//eTVOC
+      int httpCode = ThingSpeak.writeField(myChannelNumber, 4, etvoc, myWriteAPIKey);
+      if(verificare_alarma(nr,"TVOC")) { 
+        lcd.setCursor(0, 1);
+        lcd.print("Ultima:");
+        lcd.print(etvoc);
+        lcd.print("ppb");
+        delay(1000);
+      }  
+      break;
+    }
+  }
+
+  nr++;
+  if(nr==5) { //S-au achizitionat toti cei 4 parametri
+  //Realizarea cerintei: detectarea situatiilor de aer poluat si de incediu cu precizarea surselor de declansare
+    if(eco2 > 40000 && temp_c> 50) {
+         lcd.clear();
+         lcd.setCursor(0, 0);
+         lcd.print(" Posibil ");
+         lcd.setCursor(0, 1);
+         lcd.print(" incendiu !");
+         delay(2000);
+      } else if(etvoc>=70 && etvoc<200 && humidity>=65) {
+         lcd.clear();
+         lcd.setCursor(0, 0);
+         lcd.print("Sursa poluare: ");
+         lcd.setCursor(0, 1);
+         lcd.print("mucegai");
+         delay(2000);
+      } else if(etvoc>200 && etvoc<500) {
+         lcd.clear();
+         lcd.setCursor(0, 0);
+         lcd.print("Sursa poluare: ");
+         lcd.setCursor(0, 1);
+         lcd.print("fum de tigara");
+         delay(2000);
+      } else if(etvoc>=500 && etvoc<800) {
+         lcd.clear();
+         lcd.setCursor(0, 0);
+         lcd.print("Sursa poluare: ");
+         lcd.setCursor(0, 1);
+         lcd.print("parfum/adeziv");
+         delay(2000);
+      } else if(etvoc>=800 && etvoc<1500) {
+         lcd.clear();
+         lcd.setCursor(0, 0);
+         lcd.print("Sursa poluare: ");
+         lcd.setCursor(0, 1);
+         lcd.print("mat.constructii");
+         delay(500);
+         lcd.setCursor(0, 1);
+         lcd.print("vopsea,ciment...");
+         delay(2000);
+      } else if(etvoc>=1500) {
+         lcd.clear();
+         lcd.setCursor(0, 0);
+         lcd.print("POLUARE EXTREMA!");
+         lcd.setCursor(0, 1);
+         lcd.print("Surse multiple");
+         delay(2000);
+      }
+  }
+
+  //Afisarea valorilor citite de la senzori pe ecran si unitatea de masura
+  lcd.clear(); 
+  lcd.setCursor(0, 1);
+  lcd.print(temp_c);
+  lcd.write(byte(0));
+  lcd.setCursor(8, 1);
+  lcd.print(humidity);
+  lcd.print("%");
+  lcd.setCursor(0, 0);
+  lcd.print(eco2);
+  lcd.print("ppm");
+  lcd.setCursor(8, 0);
+  lcd.print(etvoc);  
+  lcd.print("ppb");
+       
+  if(nr==5) {           //Dupa afisarea si trimiterea tuturor valorilor la ThingSpeak, intram in modul DeepSleep pentru economisirea energiei
+     delay(1000);       //necesar pentru a pastra valorile pe ecran inainte de intrarea in sleep
+     lcd.setCursor(15, 1);
+     lcd.print("Z");    //Simbolul Z din dreapta jos arata ca este in modul DeepSleep
+     lcd.noBacklight(); //Cat timp este in DeepSleep oprim lumina de fundal de la LCD (valorile vor fi inca vizibile)
+     ESP.deepSleep(600e6);//600e6 inseamna 600.000.000 microsecunde = 10 minute
+     //Orice instructiune scrisa dupa DeepSlepp
+  }
+  else delay(16000);    //Daca nr!=5, mai trebuie achizitionate si celelalte valori. Vom avea un delay de 16 secunde, deoarece pe ThingSpeak nu se pot scrie valori pe un canal mai rapid de 15 secunde.
+}
