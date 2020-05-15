@@ -201,7 +201,7 @@ void loop()
          lcd.setCursor(0, 1);
          lcd.print(" incendiu !");
          delay(2000);
-      } else if(etvoc>=70 && etvoc<200 && humidity>=65) {
+      } else if(etvoc>=110 && etvoc<200 && humidity>=65) {
          lcd.clear();
          lcd.setCursor(0, 0);
          lcd.print("Sursa poluare: ");
